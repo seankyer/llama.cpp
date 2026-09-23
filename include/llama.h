@@ -417,6 +417,14 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // caller-owned KV cache. NULL: llama allocates it. llama never frees kv_data.
+        void * kv_data;
+        size_t kv_size;
+
+        // cell index from llama_kv_meta_get. NULL the first time kv_data is used.
+        const void * kv_meta;
+        size_t       kv_meta_size;
     };
 
     struct llama_model_tensor_override {
@@ -540,6 +548,17 @@ extern "C" {
             "use llama_model_free instead");
 
     LLAMA_API void llama_model_free(struct llama_model * model);
+
+    // Bytes required for kv_data with these params. Does not allocate the cache.
+    // Returns 0 if this model cannot use a caller-owned buffer.
+    LLAMA_API size_t llama_kv_size(const struct llama_model * model, struct llama_context_params params);
+
+    // Bytes of KV cache llama allocated for this context. 0 when kv_data was set.
+    LLAMA_API size_t llama_kv_self_size(const struct llama_context * ctx);
+
+    // Cell index that must be passed back as kv_meta to reuse kv_data.
+    LLAMA_API size_t llama_kv_meta_size(const struct llama_context * ctx);
+    LLAMA_API size_t llama_kv_meta_get(const struct llama_context * ctx, void * dst, size_t size);
 
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,

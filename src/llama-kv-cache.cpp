@@ -1,13 +1,20 @@
 #include "llama-kv-cache.h"
 
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "llama-context.h"
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
-#include "llama-context.h"
+
+#ifdef GGML_USE_CUDA
+#    include "ggml-cuda.h"
+#endif
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -16,6 +23,30 @@
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
+}
+
+static const uint32_t LLAMA_KV_META_MAGIC   = 0x454D564B;  // "KVME"
+static const uint32_t LLAMA_KV_META_VERSION = 1;
+
+static void place_kv_tensors(ggml_context * ctx, ggml_backend_buffer_t buffer) {
+    ggml_tallocr tallocr = ggml_tallocr_new(buffer);
+
+    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr;
+         tensor               = ggml_get_next_tensor(ctx, tensor)) {
+        ggml_status status = GGML_STATUS_SUCCESS;
+        if (tensor->data == nullptr) {
+            if (tensor->view_src == nullptr) {
+                status = ggml_tallocr_alloc(&tallocr, tensor);
+            } else if (tensor->buffer == nullptr) {
+                status = ggml_backend_view_init(tensor);
+            }
+        } else if (tensor->view_src != nullptr && tensor->buffer == nullptr) {
+            status = ggml_backend_view_init(tensor);
+        }
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("failed to place kv tensor");
+        }
+    }
 }
 
 // orthonormal Walsh-Hadamard rotation matrix
@@ -62,30 +93,37 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // llama_kv_cache
 //
 
-llama_kv_cache::llama_kv_cache(
-        const llama_model & model,
-        const llama_hparams & hparams,
-                ggml_type   type_k,
-                ggml_type   type_v,
-                     bool   v_trans,
-                     bool   offload,
-                     bool   unified,
-                 uint32_t   kv_size,
-                 uint32_t   n_seq_max,
-                 uint32_t   n_pad,
-                 uint32_t   n_swa,
-           llama_swa_type   swa_type,
-           llama_memory_t   mem_other,
-    const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share,
-             const char *   name_tag) :
-    model(model), hparams(hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+llama_kv_cache::llama_kv_cache(const llama_model &     model,
+                               const llama_hparams &   hparams,
+                               ggml_type               type_k,
+                               ggml_type               type_v,
+                               bool                    v_trans,
+                               bool                    offload,
+                               bool                    unified,
+                               uint32_t                kv_size,
+                               uint32_t                n_seq_max,
+                               uint32_t                n_pad,
+                               uint32_t                n_swa,
+                               llama_swa_type          swa_type,
+                               llama_memory_t          mem_other,
+                               const layer_filter_cb & filter,
+                               const layer_reuse_cb &  reuse,
+                               const layer_share_cb &  share,
+                               const char *            name_tag,
+                               void *                  kv_data,
+                               size_t                  kv_data_size,
+                               bool                    kv_measure) :
+    model(model),
+    hparams(hparams),
+    v_trans(v_trans),
+    n_seq_max(n_seq_max),
+    n_stream(unified ? 1 : n_seq_max),
+    n_pad(n_pad),
+    n_swa(n_swa),
+    swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
-
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
     // draft default and oversized views would overflow the source tensors
@@ -274,24 +312,84 @@ llama_kv_cache::llama_kv_cache(
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
+    if ((kv_data != nullptr || kv_measure) && ctx_map.size() != 1) {
+        throw std::runtime_error("external kv buffer requires a single buffer type");
+    }
+
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf;
+        ggml_backend_buffer_t buf      = nullptr;
+        bool                  place    = false;
+        size_t                measured = 0;
+
         if (hparams.no_alloc) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
+        } else if (kv_measure || kv_data != nullptr) {
+            measured = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+            kv_nbytes += measured;
+            caller_buffer = true;
+
+            if (kv_measure) {
+                buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/0);
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr;
+                     t               = ggml_get_next_tensor(ctx.get(), t)) {
+                    t->buffer = buf;
+                }
+            } else {
+                if (kv_data_size < measured) {
+                    throw std::runtime_error("external kv buffer is too small");
+                }
+                const size_t align = ggml_backend_buft_get_alignment(buft);
+                if (align != 0 && ((uintptr_t) kv_data) % align != 0) {
+                    throw std::runtime_error("external kv buffer is misaligned");
+                }
+                if (measured > ggml_backend_buft_get_max_size(buft)) {
+                    throw std::runtime_error("external kv buffer exceeds a single allocation");
+                }
+                if (ggml_backend_buft_is_host(buft)) {
+                    buf = ggml_backend_cpu_buffer_from_ptr(kv_data, measured);
+                } else {
+#ifdef GGML_USE_CUDA
+                    buf = ggml_backend_cuda_buffer_from_ptr(buft, kv_data, measured);
+#endif
+                }
+                if (buf == nullptr) {
+                    throw std::runtime_error("failed to bind external kv buffer");
+                }
+                external = true;
+                place    = true;
+            }
         } else {
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            if (buf != nullptr) {
+                const size_t nbytes = ggml_backend_buffer_get_size(buf);
+                kv_nbytes += nbytes;
+                kv_self_nbytes += nbytes;
+                ggml_backend_buffer_clear(buf, 0);
+            }
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
         }
 
-        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        if (kv_measure) {
+            LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB (measure)\n", __func__, ggml_backend_buft_name(buft),
+                           measured / 1024.0 / 1024.0);
+        } else if (external) {
+            LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB (external)\n", __func__, ggml_backend_buffer_name(buf),
+                           ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
+        } else {
+            LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf),
+                           ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
+        }
 
-        ggml_backend_buffer_clear(buf, 0);
+        // emplace before placing so a throw still frees the buffer object, not the caller pointer
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+        if (place) {
+            place_kv_tensors(ctxs_bufs.back().first.get(), buf);
+        }
     }
 
     {
@@ -377,6 +475,191 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
+}
+
+size_t llama_kv_cache::get_kv_nbytes() const {
+    return kv_nbytes;
+}
+
+size_t llama_kv_cache::get_kv_self_nbytes() const {
+    return kv_self_nbytes;
+}
+
+bool llama_kv_cache::uses_caller_buffer() const {
+    return caller_buffer;
+}
+
+namespace {
+
+struct kv_meta_writer {
+    std::vector<uint8_t> buf;
+
+    template <typename T> void write(const T & value) {
+        const size_t off = buf.size();
+        buf.resize(off + sizeof(T));
+        memcpy(buf.data() + off, &value, sizeof(T));
+    }
+};
+
+struct kv_meta_reader {
+    const uint8_t * data;
+    size_t          size;
+    size_t          off = 0;
+    bool            ok  = true;
+
+    template <typename T> T read() {
+        T value{};
+        if (!ok || off + sizeof(T) > size) {
+            ok = false;
+            return value;
+        }
+        memcpy(&value, data + off, sizeof(T));
+        off += sizeof(T);
+        return value;
+    }
+};
+
+}  // namespace
+
+std::vector<uint8_t> llama_kv_cache::kv_meta_blob() const {
+    if (get_has_shift()) {
+        return {};
+    }
+
+    kv_meta_writer io;
+    io.write(LLAMA_KV_META_MAGIC);
+    io.write(LLAMA_KV_META_VERSION);
+    io.write(n_stream);
+    const uint32_t has_ext = has_cell_ext() ? 1u : 0u;
+    io.write(has_ext);
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const llama_kv_cells & cells  = v_cells[s];
+        const uint32_t         n_cell = cells.size();
+        io.write(n_cell);
+        io.write(v_heads[s]);
+
+        for (uint32_t i = 0; i < n_cell; ++i) {
+            const bool      empty = cells.is_empty(i);
+            const llama_pos pos   = empty ? -1 : cells.pos_get(i);
+            io.write(pos);
+            if (has_ext) {
+                const llama_kv_cell_ext ext = empty ? llama_kv_cell_ext{} : cells.ext_get(i);
+                io.write(ext);
+            }
+
+            std::vector<llama_seq_id> seq_ids;
+            if (!empty) {
+                for (llama_seq_id cur = 0; cur < (int) n_seq_max; ++cur) {
+                    if (cells.seq_has(i, cur)) {
+                        seq_ids.push_back(cur);
+                    }
+                }
+            }
+            const uint32_t n_seq = (uint32_t) seq_ids.size();
+            io.write(n_seq);
+            for (llama_seq_id seq_id : seq_ids) {
+                io.write(seq_id);
+            }
+        }
+    }
+
+    return io.buf;
+}
+
+size_t llama_kv_cache::kv_meta_size() const {
+    return kv_meta_blob().size();
+}
+
+size_t llama_kv_cache::kv_meta_get(void * dst, size_t size) const {
+    const std::vector<uint8_t> blob = kv_meta_blob();
+    if (dst == nullptr || size < blob.size() || blob.empty()) {
+        return 0;
+    }
+    memcpy(dst, blob.data(), blob.size());
+    return blob.size();
+}
+
+bool llama_kv_cache::kv_meta_set(const void * src, size_t size) {
+    if (src == nullptr || size == 0 || get_has_shift()) {
+        return false;
+    }
+
+    kv_meta_reader io{ (const uint8_t *) src, size };
+    const uint32_t magic   = io.read<uint32_t>();
+    const uint32_t version = io.read<uint32_t>();
+    const uint32_t n_in    = io.read<uint32_t>();
+    const uint32_t has_ext = io.read<uint32_t>();
+    if (!io.ok || magic != LLAMA_KV_META_MAGIC || version != LLAMA_KV_META_VERSION || n_in != n_stream) {
+        return false;
+    }
+    if (has_ext != (has_cell_ext() ? 1u : 0u)) {
+        return false;
+    }
+
+    struct cell_in {
+        llama_pos                 pos;
+        llama_kv_cell_ext         ext;
+        std::vector<llama_seq_id> seqs;
+    };
+
+    struct stream_in {
+        uint32_t             head;
+        std::vector<cell_in> cells;
+    };
+
+    std::vector<stream_in> streams(n_stream);
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const uint32_t n_cell = io.read<uint32_t>();
+        const uint32_t head   = io.read<uint32_t>();
+        if (!io.ok || n_cell != v_cells[s].size() || head > n_cell) {
+            return false;
+        }
+        streams[s].head = head;
+        streams[s].cells.resize(n_cell);
+        for (uint32_t i = 0; i < n_cell; ++i) {
+            cell_in & cell = streams[s].cells[i];
+            cell.pos       = io.read<llama_pos>();
+            if (has_ext) {
+                cell.ext = io.read<llama_kv_cell_ext>();
+            }
+            const uint32_t n_seq = io.read<uint32_t>();
+            if (!io.ok || n_seq > n_seq_max || (cell.pos == -1 && n_seq != 0)) {
+                return false;
+            }
+            cell.seqs.resize(n_seq);
+            for (uint32_t seq = 0; seq < n_seq; ++seq) {
+                cell.seqs[seq] = io.read<llama_seq_id>();
+                if (!io.ok || cell.seqs[seq] < 0 || cell.seqs[seq] >= (llama_seq_id) n_seq_max) {
+                    return false;
+                }
+            }
+        }
+    }
+    if (!io.ok || io.off != io.size) {
+        return false;
+    }
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        v_cells[s].reset();
+        v_heads[s] = streams[s].head;
+        for (uint32_t i = 0; i < streams[s].cells.size(); ++i) {
+            const cell_in & cell = streams[s].cells[i];
+            if (cell.pos == -1) {
+                continue;
+            }
+            v_cells[s].pos_set(i, cell.pos);
+            if (has_ext) {
+                v_cells[s].ext_set(i, cell.ext);
+            }
+            for (llama_seq_id seq_id : cell.seqs) {
+                v_cells[s].seq_add(i, seq_id);
+            }
+        }
+    }
+
+    return true;
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

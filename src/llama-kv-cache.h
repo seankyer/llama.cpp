@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <cstdint>
 #include <unordered_map>
 #include <vector>
 
@@ -96,25 +97,27 @@ public:
     // TODO: refactor the memory instances to not depend on `llama_model`
     //       instead pass all necessary info (e.g. hparams, dev layers, arch, etc.) directly
     //       likely through `struct llama_memory_params`
-    llama_kv_cache(
-            const llama_model & model,
-          const llama_hparams & hparams,
-                    ggml_type   type_k,
-                    ggml_type   type_v,
-                         bool   v_trans,
-                         bool   offload,
-                         bool   unified,
-                     uint32_t   kv_size,
-                     uint32_t   n_seq_max,
-                     uint32_t   n_pad,
-                     uint32_t   n_swa,
-               llama_swa_type   swa_type,
-               llama_memory_t   mem_other,
-        const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share,
-        // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+    llama_kv_cache(const llama_model &     model,
+                   const llama_hparams &   hparams,
+                   ggml_type               type_k,
+                   ggml_type               type_v,
+                   bool                    v_trans,
+                   bool                    offload,
+                   bool                    unified,
+                   uint32_t                kv_size,
+                   uint32_t                n_seq_max,
+                   uint32_t                n_pad,
+                   uint32_t                n_swa,
+                   llama_swa_type          swa_type,
+                   llama_memory_t          mem_other,
+                   const layer_filter_cb & filter,
+                   const layer_reuse_cb &  reuse,
+                   const layer_share_cb &  share,
+                   // a model can hold more than one cache, so the tensor names have to stay unique
+                   const char *            name_tag     = "",
+                   void *                  kv_data      = nullptr,
+                   size_t                  kv_data_size = 0,
+                   bool                    kv_measure   = false);
 
     ~llama_kv_cache() = default;
 
@@ -145,6 +148,13 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+
+    size_t get_kv_nbytes() const override;
+    size_t get_kv_self_nbytes() const override;
+    bool   uses_caller_buffer() const override;
+    size_t kv_meta_size() const override;
+    size_t kv_meta_get(void * dst, size_t size) const override;
+    bool   kv_meta_set(const void * src, size_t size) override;
 
     // state write/load
 
@@ -290,6 +300,18 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // True when kv_data was bound. The buffer is not freed with the cache.
+    bool external = false;
+
+    // True for an external buffer and for a size measurement.
+    bool caller_buffer = false;
+
+    // Tensor bytes, including allocator padding. self is 0 when the caller owns the buffer.
+    size_t kv_nbytes      = 0;
+    size_t kv_self_nbytes = 0;
+
+    std::vector<uint8_t> kv_meta_blob() const;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

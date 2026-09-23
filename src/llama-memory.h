@@ -25,6 +25,16 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // Caller-owned KV bytes. NULL allocates as usual.
+    void * kv_data;
+    size_t kv_data_size;
+
+    // Compute the byte size and do not allocate. Used by llama_kv_size.
+    bool kv_measure;
+
+    const void * kv_meta;
+    size_t       kv_meta_size;
 };
 
 enum llama_memory_status {
@@ -117,6 +127,29 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+
+    // Bytes the cache occupies. 0 when this memory type has no KV tensors.
+    virtual size_t get_kv_nbytes() const { return 0; }
+
+    // Bytes llama allocated for the KV cache. 0 when the caller owns the buffer.
+    virtual size_t get_kv_self_nbytes() const { return 0; }
+
+    // True when this object was built for a caller-owned buffer or a size measurement.
+    virtual bool uses_caller_buffer() const { return false; }
+
+    virtual size_t kv_meta_size() const { return 0; }
+
+    virtual size_t kv_meta_get(void * dst, size_t size) const {
+        GGML_UNUSED(dst);
+        GGML_UNUSED(size);
+        return 0;
+    }
+
+    virtual bool kv_meta_set(const void * src, size_t size) {
+        GGML_UNUSED(src);
+        GGML_UNUSED(size);
+        return false;
+    }
 
     //
     // state write/read

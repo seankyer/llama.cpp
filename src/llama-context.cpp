@@ -385,15 +385,35 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
+        if (params.kv_meta != nullptr && params.kv_data == nullptr) {
+            throw std::runtime_error("kv_meta requires kv_data");
+        }
+        if ((params.kv_meta == nullptr) != (params.kv_meta_size == 0)) {
+            throw std::runtime_error("kv_meta size does not match the blob");
+        }
+
         llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
-            /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.type_k        =*/params.type_k,
+            /*.type_v        =*/params.type_v,
+            /*.swa_full      =*/params.swa_full,
+            /*.ctx_type      =*/cparams.ctx_type,
+            /*.mem_other     =*/llama_get_memory(cparams.ctx_other),
+            /*.kv_data       =*/params.kv_data,
+            /*.kv_data_size  =*/params.kv_size,
+            /*.kv_measure    =*/false,
+            /*.kv_meta       =*/nullptr,
+            /*.kv_meta_size  =*/0,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+        if (params.kv_data != nullptr) {
+            if (memory == nullptr || !memory->uses_caller_buffer()) {
+                throw std::runtime_error("external kv buffer is not supported for this model");
+            }
+            if (params.kv_meta != nullptr && !memory->kv_meta_set(params.kv_meta, params.kv_meta_size)) {
+                throw std::runtime_error("failed to restore kv meta");
+            }
+        }
     }
 
     // init backends
@@ -3731,9 +3751,104 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.kv_data                     =*/ nullptr,
+        /*.kv_size                     =*/ 0,
+        /*.kv_meta                     =*/ nullptr,
+        /*.kv_meta_size                =*/ 0,
     };
 
     return result;
+}
+
+static llama_cparams llama_cparams_for_kv(const llama_model & model, llama_context_params params) {
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model.arch == LLM_ARCH_GROK) {
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
+    if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
+
+    llama_cparams cparams = {};
+    cparams.n_seq_max     = std::max(1u, params.n_seq_max);
+    cparams.n_ctx         = params.n_ctx == 0 ? model.hparams.n_ctx_train : params.n_ctx;
+    cparams.n_ctx         = GGML_PAD(cparams.n_ctx, 256);
+    cparams.kv_unified    = params.kv_unified;
+    if (cparams.kv_unified) {
+        cparams.n_ctx_seq = cparams.n_ctx;
+    } else {
+        cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
+        cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
+        if (cparams.n_ctx_seq == 0) {
+            return {};
+        }
+        cparams.n_ctx = cparams.n_ctx_seq * cparams.n_seq_max;
+    }
+    cparams.flash_attn  = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cparams.offload_kqv = params.offload_kqv;
+    cparams.n_batch     = params.n_batch;
+    cparams.n_ubatch    = params.n_ubatch == 0 ? params.n_batch : std::min(params.n_batch, params.n_ubatch);
+    cparams.ctx_type    = params.ctx_type;
+    cparams.causal_attn = true;
+    return cparams;
+}
+
+size_t llama_kv_size(const llama_model * model, llama_context_params params) {
+    if (model == nullptr) {
+        return 0;
+    }
+
+    const llama_cparams cparams = llama_cparams_for_kv(*model, params);
+    if (cparams.n_ctx_seq == 0) {
+        return 0;
+    }
+
+    llama_memory_params params_mem = {
+        /*.type_k        =*/params.type_k,
+        /*.type_v        =*/params.type_v,
+        /*.swa_full      =*/params.swa_full,
+        /*.ctx_type      =*/cparams.ctx_type,
+        /*.mem_other     =*/nullptr,
+        /*.kv_data       =*/nullptr,
+        /*.kv_data_size  =*/0,
+        /*.kv_measure    =*/true,
+        /*.kv_meta       =*/nullptr,
+        /*.kv_meta_size  =*/0,
+    };
+
+    try {
+        std::unique_ptr<llama_memory_i> memory(model->create_memory(params_mem, cparams));
+        if (memory == nullptr) {
+            return 0;
+        }
+        return memory->get_kv_nbytes();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+    }
+    return 0;
+}
+
+size_t llama_kv_self_size(const llama_context * ctx) {
+    const llama_memory_i * memory = llama_get_memory(ctx);
+    if (memory == nullptr) {
+        return 0;
+    }
+    return memory->get_kv_self_nbytes();
+}
+
+size_t llama_kv_meta_size(const llama_context * ctx) {
+    const llama_memory_i * memory = llama_get_memory(ctx);
+    if (memory == nullptr) {
+        return 0;
+    }
+    return memory->kv_meta_size();
+}
+
+size_t llama_kv_meta_get(const llama_context * ctx, void * dst, size_t size) {
+    const llama_memory_i * memory = llama_get_memory(ctx);
+    if (memory == nullptr) {
+        return 0;
+    }
+    return memory->kv_meta_get(dst, size);
 }
 
 llama_context * llama_init_from_model(

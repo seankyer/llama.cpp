@@ -310,6 +310,11 @@ endif()
 llama_build(test-backend-ops.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
+llama_build_and_test(test-kv-external.cpp       LABEL "model")
+if (GGML_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(test-kv-external PRIVATE CUDA::cudart)
+endif()
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 

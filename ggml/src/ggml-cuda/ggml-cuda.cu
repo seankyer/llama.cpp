@@ -726,15 +726,19 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
+    bool        owned   = true;
     std::string name;
 
-    ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
-        device(device), dev_ptr(dev_ptr),
-        name(GGML_CUDA_NAME + std::to_string(device)) {
-    }
+    ggml_backend_cuda_buffer_context(int device, void * dev_ptr, bool owned = true) :
+        device(device),
+        dev_ptr(dev_ptr),
+        owned(owned),
+        name(GGML_CUDA_NAME + std::to_string(device)) {}
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (owned && dev_ptr != nullptr) {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -895,6 +899,18 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     }
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
+
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+}
+
+ggml_backend_buffer_t ggml_backend_cuda_buffer_from_ptr(ggml_backend_buffer_type_t buft, void * ptr, size_t size) {
+    if (buft == nullptr || ptr == nullptr || !ggml_backend_buft_is_cuda(buft)) {
+        return nullptr;
+    }
+
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+    ggml_backend_cuda_buffer_context *      ctx =
+        new ggml_backend_cuda_buffer_context(buft_ctx->device, ptr, /*owned =*/false);
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }

@@ -2272,7 +2272,7 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
-    llama_memory_i * res;
+    llama_memory_i * res = nullptr;
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the
@@ -2750,10 +2750,23 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 filter,
                                 nullptr,
-                                nullptr);
+                                nullptr,
+                                "",
+                                params.kv_data,
+                                params.kv_data_size,
+                                params.kv_measure);
                     }
                 }
             }
+    }
+
+    if (params.kv_data != nullptr || params.kv_measure) {
+        llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(res);
+        if (kv == nullptr || !kv->uses_caller_buffer()) {
+            delete res;
+            LLAMA_LOG_ERROR("%s: external kv buffer is not supported for this model\n", __func__);
+            return nullptr;
+        }
     }
 
     return res;
