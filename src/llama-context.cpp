@@ -3851,6 +3851,38 @@ size_t llama_kv_meta_get(const llama_context * ctx, void * dst, size_t size) {
     return memory->kv_meta_get(dst, size);
 }
 
+bool llama_kv_rebind(llama_context * ctx, void * kv_data, size_t kv_size, const void * kv_meta, size_t kv_meta_size) {
+    if (ctx == nullptr || kv_data == nullptr || kv_size == 0) {
+        return false;
+    }
+
+    ggml_backend_sched_t sched = ctx->get_sched();
+    if (sched != nullptr) {
+        ggml_backend_sched_synchronize(sched);
+    }
+
+    llama_memory_i * memory = llama_get_memory(ctx);
+    if (memory == nullptr || !memory->rebind_external(kv_data, kv_size, kv_meta, kv_meta_size)) {
+        return false;
+    }
+
+    ctx->drop_kv_graphs();
+    return true;
+}
+
+void llama_context::drop_kv_graphs() {
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
+
+    if (sched) {
+        ggml_backend_sched_reset(sched.get());
+    }
+}
+
 llama_context * llama_init_from_model(
                  llama_model * model,
         llama_context_params   params) {

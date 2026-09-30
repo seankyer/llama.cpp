@@ -151,6 +151,15 @@ struct llama_memory_i {
         return false;
     }
 
+    // Point a caller-owned KV buffer at a new address. Default: this memory does not support it.
+    virtual bool rebind_external(void * kv_data, size_t kv_size, const void * kv_meta, size_t kv_meta_size) {
+        GGML_UNUSED(kv_data);
+        GGML_UNUSED(kv_size);
+        GGML_UNUSED(kv_meta);
+        GGML_UNUSED(kv_meta_size);
+        return false;
+    }
+
     //
     // state write/read
     //

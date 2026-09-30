@@ -560,6 +560,14 @@ extern "C" {
     LLAMA_API size_t llama_kv_meta_size(const struct llama_context * ctx);
     LLAMA_API size_t llama_kv_meta_get(const struct llama_context * ctx, void * dst, size_t size);
 
+    // Point this context's caller-owned KV tensors at kv_data. Does not allocate scratch.
+    // kv_meta NULL or size 0 clears the cell map. Otherwise kv_meta is llama_kv_meta_get output.
+    // The pointer is only required to stay live for later decode calls that use this context.
+    LLAMA_API bool llama_kv_rebind(
+            struct llama_context * ctx,
+            void * kv_data, size_t kv_size,
+            const void * kv_meta, size_t kv_meta_size);
+
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
             struct llama_context_params   params);

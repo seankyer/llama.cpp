@@ -662,6 +662,61 @@ bool llama_kv_cache::kv_meta_set(const void * src, size_t size) {
     return true;
 }
 
+bool llama_kv_cache::rebind_external(void * kv_data, size_t kv_size, const void * kv_meta, size_t kv_meta_size) {
+    if (!external || kv_data == nullptr || ctxs_bufs.size() != 1) {
+        return false;
+    }
+
+    ggml_backend_buffer_t old_buf = ctxs_bufs[0].second.get();
+    if (old_buf == nullptr) {
+        return false;
+    }
+
+    const size_t old_size = ggml_backend_buffer_get_size(old_buf);
+    if (kv_size < old_size) {
+        return false;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(old_buf);
+    if (buft == nullptr || ggml_backend_buffer_get_base(old_buf) == nullptr) {
+        return false;
+    }
+
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    if (align != 0 && ((uintptr_t) kv_data) % align != 0) {
+        return false;
+    }
+
+    ggml_backend_buffer_t new_buf = nullptr;
+    if (ggml_backend_buft_is_host(buft)) {
+        new_buf = ggml_backend_cpu_buffer_from_ptr(kv_data, old_size);
+    } else {
+#ifdef GGML_USE_CUDA
+        new_buf = ggml_backend_cuda_buffer_from_ptr(buft, kv_data, old_size);
+#endif
+    }
+    if (new_buf == nullptr) {
+        return false;
+    }
+
+    ggml_context * gctx = ctxs_bufs[0].first.get();
+    for (ggml_tensor * tensor = ggml_get_first_tensor(gctx); tensor != nullptr;
+         tensor = ggml_get_next_tensor(gctx, tensor)) {
+        tensor->data = nullptr;
+        tensor->buffer = nullptr;
+    }
+    // place_kv_tensors only assigns tensors whose data is still null.
+    place_kv_tensors(gctx, new_buf);
+
+    // Frees the wrapper only. Caller-owned buffers are not cudaFree'd.
+    ctxs_bufs[0].second.reset(new_buf);
+
+    if (kv_meta == nullptr || kv_meta_size == 0) {
+        return seq_rm(-1, -1, -1);
+    }
+    return kv_meta_set(kv_meta, kv_meta_size);
+}
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {

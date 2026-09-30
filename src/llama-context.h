@@ -77,6 +77,9 @@ struct llama_context {
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
+    // Drop cached graphs that still point at the previous KV buffer.
+    void drop_kv_graphs();
+
     enum llama_pooling_type pooling_type() const;
 
     float * get_logits();

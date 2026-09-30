@@ -155,6 +155,7 @@ public:
     size_t kv_meta_size() const override;
     size_t kv_meta_get(void * dst, size_t size) const override;
     bool   kv_meta_set(const void * src, size_t size) override;
+    bool   rebind_external(void * kv_data, size_t kv_size, const void * kv_meta, size_t kv_meta_size) override;
 
     // state write/load
 
